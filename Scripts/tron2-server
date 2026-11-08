@@ -1,0 +1,83 @@
+#!/bin/sh
+# Start the Tron 2.0 dedicated server (START_EXE).
+#
+# TRONSrv.exe only loads the rez files built into it (game.rez, game2.rez, sound.rez, ...). The
+# 1.042 patch content (gamep5.rez holds the game code, OBJECT.LTO) comes in through the registry:
+# HKLM\Software\Monolith Productions\TRON 2.0\1.0 UpdateNum / UpdateCommandLine<N>, whose `-rez X`
+# entries are added to the list. Without them the server stops with "Unable to load resources".
+# This script writes those values (from TRON2_REZ) and SelectedMod (TRON2_MOD, which loads every
+# rez in Custom\Mods\<mod>), then runs `TRONSrv.exe -config <TRON2_CONFIG>` under Wine with Xvfb.
+# -config loads ServerData\<TRON2_CONFIG>.txt, which the configure hook fills in, and starts
+# hosting without any dialog. Its console is a list box in that window, so nothing reaches docker
+# logs; check the server with a GameSpy `\status\` query to the game port. Any START_ARGS are
+# appended.
+set -e
+
+root="${SERVER_ROOT:-/config/Merged}"
+cfg="${TRON2_CONFIG:-lancommander}"
+
+cd "$root"
+
+if [ ! -f TRONSrv.exe ]; then
+    echo "TRONSrv.exe not found in $root. Put a Tron 2.0 v1.042 install in /config/Server." >&2
+    exit 1
+fi
+
+if [ ! -f "ServerData/$cfg.txt" ]; then
+    echo "ServerData/$cfg.txt not found in $root; TRONSrv would stop with 'No server configuration file'." >&2
+    exit 1
+fi
+
+# Case-insensitive lookup of a file or folder in the game root; prints its real name
+find_entry() {
+    find . -mindepth 1 -maxdepth "$(($(printf '%s' "$1" | tr -cd '/' | wc -c) + 1))" \
+        -ipath "./$1" -print 2>/dev/null | head -n 1 | sed 's|^\./||'
+}
+
+rez="${TRON2_REZ:-}"
+if [ -z "$rez" ]; then
+    rez="gamep5.rez,gamep6.rez,tcdg/game"
+    auto=1
+fi
+
+cmdline=""
+old_ifs="$IFS"; IFS=','
+for item in $rez; do
+    item=$(printf '%s' "$item" | sed 's/^ *//; s/ *$//; s|\\|/|g')
+    [ -n "$item" ] || continue
+    found=$(find_entry "$item")
+    if [ -z "$found" ]; then
+        [ -n "${auto:-}" ] || echo "Warning: rez '$item' not found in $root; skipping it" >&2
+        continue
+    fi
+    win=$(printf '%s' "$found" | sed 's|/|\\|g')
+    case "$win" in
+        *' '*) cmdline="$cmdline -rez \"$win\"" ;;
+        *)     cmdline="$cmdline -rez $win" ;;
+    esac
+done
+IFS="$old_ifs"
+cmdline="${cmdline# }"
+
+if [ -z "$(find_entry gamep5.rez)" ]; then
+    echo "Warning: gamep5.rez not found; TRONSrv.exe needs the v1.042 patch files." >&2
+fi
+
+key='HKLM\Software\Monolith Productions\TRON 2.0\1.0'
+wine reg add "$key" /v UpdateNum /t REG_DWORD /d 1 /f /reg:32 >/dev/null
+wine reg add "$key" /v UpdateCommandLine0 /t REG_SZ /d "$cmdline" /f /reg:32 >/dev/null
+wine reg add "$key" /v SelectedMod /t REG_SZ /d "${TRON2_MOD:-Retail}" /f /reg:32 >/dev/null
+
+# `wine reg` started a wineserver without a display. TRONSrv would join it and fail to create its
+# window (nodrv_CreateWindow, then a page fault), so let it exit before starting under Xvfb.
+wineserver -w
+
+set -- -config "$cfg" "$@"
+
+printf 'Extra rez files: %s\n' "${cmdline:-none}"
+printf 'Mod: %s\n' "${TRON2_MOD:-Retail}"
+printf 'Starting: TRONSrv.exe %s\n' "$*"
+printf 'Game port and status queries on %s/udp\n' "${TRON2_PORT:-27888}"
+
+export WINE_XVFB="${WINE_XVFB:-true}"
+exec wine-run TRONSrv.exe "$@"
